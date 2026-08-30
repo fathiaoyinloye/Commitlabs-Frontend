@@ -7,7 +7,12 @@ import { TooManyRequestsError, ValidationError } from '@/lib/backend/errors';
 import { getClientIp } from '@/lib/backend/getClientIp';
 import { idempotencyService } from '@/lib/backend/idempotency';
 import { parseJsonWithLimit, JSON_BODY_LIMITS } from '@/lib/backend/jsonBodyLimit';
+import {
+  assertWalletMatchesSession,
+  MarketplaceCreateListingBoundarySchema,
+} from '@/lib/backend/marketplaceBoundary';
 import { checkRateLimit, getRateLimitWindowSeconds } from '@/lib/backend/rateLimit';
+import { verifyAuth } from '@/lib/backend/requireAuth';
 import {
   getMarketplaceSortKeys,
   isMarketplaceSortBy,
@@ -17,7 +22,7 @@ import {
   type MarketplacePublicListing,
 } from '@/lib/backend/services/marketplace';
 import { withApiHandler } from '@/lib/backend/withApiHandler';
-import type { CreateListingRequest, CreateListingResponse } from '@/types/marketplace';
+import type { CreateListingResponse } from '@/types/marketplace';
 
 const COMMITMENT_TYPES: readonly MarketplaceCommitmentType[] = [
   'Safe',
@@ -112,16 +117,22 @@ function parseQuery(searchParams: URLSearchParams): ParseResult {
     );
   }
 
-  return {
-    type: parseType(searchParams),
-    minCompliance: parseNumber(searchParams, 'minCompliance'),
-    maxLoss: parseNumber(searchParams, 'maxLoss'),
-    minAmount,
-    maxAmount,
-    sortBy,
+  const type = parseType(searchParams);
+  const minCompliance = parseNumber(searchParams, 'minCompliance');
+  const maxLoss = parseNumber(searchParams, 'maxLoss');
+  const result: ParseResult = {
     page: parseInteger(searchParams, 'page', 1),
     pageSize: parseInteger(searchParams, 'pageSize', 10),
   };
+
+  if (type !== undefined) result.type = type;
+  if (minCompliance !== undefined) result.minCompliance = minCompliance;
+  if (maxLoss !== undefined) result.maxLoss = maxLoss;
+  if (minAmount !== undefined) result.minAmount = minAmount;
+  if (maxAmount !== undefined) result.maxAmount = maxAmount;
+  if (sortBy !== undefined) result.sortBy = sortBy;
+
+  return result;
 }
 
 export const GET = withApiHandler(
