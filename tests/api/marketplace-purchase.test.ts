@@ -15,6 +15,15 @@ vi.mock('@/lib/backend/services/contracts', () => ({
   transferOwnership: vi.fn(),
 }));
 
+vi.mock('@/lib/backend/idempotency', () => ({
+  idempotencyService: {
+    getRecord: vi.fn(),
+    start: vi.fn(),
+    complete: vi.fn(),
+    fail: vi.fn(),
+  },
+}));
+
 vi.mock('@/lib/backend/services/marketplace', () => ({
   marketplaceService: {
     getListing: vi.fn(),
@@ -31,6 +40,7 @@ import type { NextRequest } from 'next/server';
 import { checkRateLimit } from '@/lib/backend/rateLimit';
 import { assertMutationCsrf } from '@/lib/backend/csrf';
 import { transferOwnership } from '@/lib/backend/services/contracts';
+import { idempotencyService } from '@/lib/backend/idempotency';
 import { marketplaceService } from '@/lib/backend/services/marketplace';
 import { CsrfValidationError } from '@/lib/backend/errors';
 
@@ -39,6 +49,8 @@ const mockedAssertMutationCsrf = vi.mocked(assertMutationCsrf);
 const mockedTransferOwnership = vi.mocked(transferOwnership);
 const mockedGetListing = vi.mocked(marketplaceService.getListing);
 const mockedCompletePurchase = vi.mocked(marketplaceService.completePurchase);
+const mockedIdempotencyGetRecord = vi.mocked(idempotencyService.getRecord);
+const mockedIdempotencyStart = vi.mocked(idempotencyService.start);
 
 const mockPOST = POST as (
   req: NextRequest,
@@ -90,6 +102,8 @@ describe('POST /api/marketplace/listings/[id]/purchase', () => {
     mockedGetListing.mockResolvedValue(ACTIVE_LISTING as any);
     mockedTransferOwnership.mockResolvedValue(TRANSFER_RESULT);
     mockedCompletePurchase.mockResolvedValue(SOLD_LISTING as any);
+    mockedIdempotencyGetRecord.mockResolvedValue(null);
+    mockedIdempotencyStart.mockResolvedValue(true);
   });
 
   describe('successful purchase — end to end', () => {
@@ -142,9 +156,62 @@ describe('POST /api/marketplace/listings/[id]/purchase', () => {
         'api/marketplace/listings/purchase',
       );
     });
+
+    it('replays a completed idempotent purchase response', async () => {
+      mockedIdempotencyGetRecord.mockResolvedValue({
+        key: 'purchase-key',
+        status: 'COMPLETED',
+        response: {
+          listingId: 'listing_1_123',
+          commitmentId: 'commitment_123',
+          buyerAddress: BUYER_ADDRESS,
+          sellerAddress: SELLER_ADDRESS,
+          txHash: '0xcached',
+          purchasedAt: '2026-01-02T00:00:00.000Z',
+        },
+        statusCode: 200,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 86400000,
+      });
+
+      const [req, ctx] = purchaseRequest('listing_1_123', { buyerAddress: BUYER_ADDRESS });
+      Object.defineProperty(req, 'headers', {
+        value: new Headers({ 'idempotency-key': 'purchase-key' }),
+        configurable: true,
+      });
+
+      const response = await mockPOST(req, ctx);
+      const result = await parseResponse(response);
+
+      expect(result.status).toBe(200);
+      expect(result.data.data.txHash).toBe('0xcached');
+      expect(mockedTransferOwnership).not.toHaveBeenCalled();
+    });
   });
 
   describe('400 - validation errors', () => {
+    it('rejects duplicate in-flight purchase requests for the same idempotency key', async () => {
+      mockedIdempotencyGetRecord.mockResolvedValue({
+        key: 'purchase-key',
+        status: 'STARTED',
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 86400000,
+      });
+
+      const [req, ctx] = purchaseRequest('listing_1_123', { buyerAddress: BUYER_ADDRESS });
+      Object.defineProperty(req, 'headers', {
+        value: new Headers({ 'idempotency-key': 'purchase-key' }),
+        configurable: true,
+      });
+
+      const response = await mockPOST(req, ctx);
+      const result = await parseResponse(response);
+
+      expect(result.status).toBe(409);
+      expect(result.data.error.code).toBe('CONFLICT');
+      expect(mockedTransferOwnership).not.toHaveBeenCalled();
+    });
+
     it('rejects a missing buyerAddress', async () => {
       const [req, ctx] = purchaseRequest('listing_1_123', {});
       const response = await mockPOST(req, ctx);

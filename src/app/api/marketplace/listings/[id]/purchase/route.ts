@@ -12,6 +12,7 @@ import {
 } from '@/lib/backend/errors';
 import { getClientIp } from '@/lib/backend/getClientIp';
 import { isFeatureEnabled } from '@/lib/backend/config';
+import { idempotencyService } from '@/lib/backend/idempotency';
 import { transferOwnership } from '@/lib/backend/services/contracts';
 import { marketplaceService } from '@/lib/backend/services/marketplace';
 import { checkRateLimit, getRateLimitWindowSeconds } from '@/lib/backend/rateLimit';
@@ -72,42 +73,66 @@ export const POST = withApiHandler(
 
     const buyerAddress = validation.data.buyerAddress;
 
-    const listing = await marketplaceService.getListing(id);
-    if (!listing) {
-      throw new NotFoundError('Listing', { listingId: id });
+    const idempotencyKey = req.headers.get('idempotency-key');
+    if (idempotencyKey) {
+      const record = await idempotencyService.getRecord(idempotencyKey);
+      if (record) {
+        if (record.status === 'COMPLETED') {
+          return ok(record.response, undefined, record.statusCode, correlationId);
+        }
+        if (record.status === 'STARTED') {
+          throw new ConflictError('A request with this Idempotency-Key is currently processing');
+        }
+      }
+      await idempotencyService.start(idempotencyKey);
     }
 
-    if (listing.status !== 'Active') {
-      throw new ConflictError('Only active listings can be purchased', {
-        listingId: id,
-        currentStatus: listing.status,
-      });
+    try {
+      const listing = await marketplaceService.getListing(id);
+      if (!listing) {
+        throw new NotFoundError('Listing', { listingId: id });
+      }
+
+      if (listing.status !== 'Active') {
+        throw new ConflictError('Only active listings can be purchased', {
+          listingId: id,
+          currentStatus: listing.status,
+        });
+      }
+
+      if (listing.sellerAddress === buyerAddress) {
+        throw new ForbiddenError('Cannot purchase your own listing', {
+          listingId: id,
+        });
+      }
+
+      const commitmentId = listing.commitmentId;
+      const fromAddress = listing.sellerAddress;
+      const toAddress = buyerAddress;
+
+      const transfer = await transferOwnership({ commitmentId, fromAddress, toAddress });
+      const purchasedListing = await marketplaceService.completePurchase(id, buyerAddress);
+
+      const responseData = {
+        listingId: purchasedListing.id,
+        commitmentId,
+        buyerAddress,
+        sellerAddress: fromAddress,
+        txHash: transfer.txHash,
+        purchasedAt: purchasedListing.updatedAt,
+      };
+
+      if (idempotencyKey) {
+        await idempotencyService.complete(idempotencyKey, responseData, 200);
+      }
+
+      return ok(responseData, undefined, 200, correlationId);
+    } catch (error) {
+      if (idempotencyKey) {
+        await idempotencyService.fail(idempotencyKey);
+      }
+      throw error;
     }
-
-    if (listing.sellerAddress === buyerAddress) {
-      throw new ForbiddenError('Cannot purchase your own listing', {
-        listingId: id,
-      });
-    }
-
-    const commitmentId = listing.commitmentId;
-    const fromAddress = listing.sellerAddress;
-    const toAddress = buyerAddress;
-
-    const transfer = await transferOwnership({ commitmentId, fromAddress, toAddress });
-
-    const purchasedListing = await marketplaceService.completePurchase(id, buyerAddress);
-
-    const responseData = {
-      listingId: purchasedListing.id,
-      commitmentId,
-      buyerAddress,
-      sellerAddress: fromAddress,
-      txHash: transfer.txHash,
-      purchasedAt: purchasedListing.updatedAt,
-    };
-
-    return ok(responseData, undefined, 200, correlationId);
   },
   { cors: MARKETPLACE_PURCHASE_CORS_POLICY },
 );
